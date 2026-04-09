@@ -1029,8 +1029,9 @@ function clickSquare(sq) {
 }
 
 function brainMove() {
-  if (!brain) return;
+  if (!brain) { setStatus('Brain not loaded!', 'error'); return; }
   setStatus('Brain thinking...', 'thinking');
+  console.log('brainMove called, brain loaded:', !!brain, 'committee:', Object.keys(committee));
 
   setTimeout(() => {
     // CB-3: Build PGN with material markers (matching training data format)
@@ -1077,12 +1078,16 @@ function brainMove() {
     for (const [name, b] of activeBrains) {
       if (!b) continue;
       const w = weights[name] || 0;
-      for (let i = 0; i < 2; i++) {
-        const san = b.generateConstrained(prompt, legalSANs, adjustedTemp + i * 0.2);
-        if (san) {
-          votes[san] = (votes[san] || 0) + w * (2 - i);
-          if (!brainVotes[name]) brainVotes[name] = san;
+      try {
+        for (let i = 0; i < 2; i++) {
+          const san = b.generateConstrained(prompt, legalSANs, adjustedTemp + i * 0.2);
+          if (san) {
+            votes[san] = (votes[san] || 0) + w * (2 - i);
+            if (!brainVotes[name]) brainVotes[name] = san;
+          }
         }
+      } catch(e) {
+        console.error(`Brain ${name} error:`, e);
       }
     }
 
