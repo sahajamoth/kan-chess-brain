@@ -890,22 +890,58 @@ const UNICODE_PIECES = {
 };
 
 let game = new ChessGame();
-let brain = null;
-let brains = {};  // split brain: {opening, tactical, endgame}
-let useSplitBrain = false;
+let brain = null;       // unified (hub, always loaded)
+let committee = {};     // {opening, early_mid, late_mid, pre_endgame, endgame}
+let committeeReady = false;
 let selected = -1;
 let validMoves = [];
 
-// Router: pick the right brain based on game phase
-function getActiveBrain() {
-  if (!useSplitBrain || !brains.opening) return brain;
-  const halfMoves = game.moves.length;
-  // Count material
+// Thousand Brains soft router: smooth sigmoid weights
+function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+
+function getCommitteeWeights() {
+  const hm = game.moves.length;  // half-moves
   let pieces = 0;
   for (let sq = 0; sq < 64; sq++) if (game.board[sq]) pieces++;
-  if (pieces <= 12 && halfMoves > 40 && brains.endgame) return brains.endgame;
-  if (halfMoves < 20 && brains.opening) return brains.opening;
-  return brains.tactical || brain;
+
+  // Smooth phase weights (overlapping sigmoids)
+  const w = {
+    unified: 0.4,  // rich-club hub, always active
+    opening: sigmoid((12 - hm) / 3) * 0.6,
+    early_mid: Math.exp(-((hm - 20) ** 2) / 100) * 0.5,
+    late_mid: Math.exp(-((hm - 40) ** 2) / 150) * 0.5,
+    pre_endgame: Math.exp(-((hm - 55) ** 2) / 150) * 0.4,
+    endgame: sigmoid((20 - pieces) / 3) * sigmoid((hm - 50) / 5) * 0.5,
+  };
+
+  // Normalize
+  const sum = Object.values(w).reduce((a, b) => a + b, 0);
+  for (const k of Object.keys(w)) w[k] /= sum;
+  return w;
+}
+
+// Lazy-load a specialist brain
+async function loadSpecialist(name) {
+  if (committee[name]) return;
+  try {
+    const resp = await fetch(`committee_${name}.json`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    committee[name] = new KANBrain(data);
+  } catch(e) { /* specialist not available */ }
+}
+
+// Pre-load specialists based on game phase
+async function preloadForPhase() {
+  const hm = game.moves.length;
+  let pieces = 0;
+  for (let sq = 0; sq < 64; sq++) if (game.board[sq]) pieces++;
+  // Always load opening at start
+  if (hm < 20) await loadSpecialist('opening');
+  if (hm >= 8 && hm < 30) await loadSpecialist('early_mid');
+  if (hm >= 20 && hm < 50) await loadSpecialist('late_mid');
+  if (hm >= 40 || pieces < 20) await loadSpecialist('pre_endgame');
+  if (hm >= 50 || pieces < 14) await loadSpecialist('endgame');
 }
 
 function renderBoard() {
@@ -1005,47 +1041,70 @@ function brainMove() {
       return;
     }
 
-    // Route to specialist brain based on game phase
-    const activeBrain = getActiveBrain();
-    const phaseName = activeBrain === brains.opening ? 'opening' : activeBrain === brains.endgame ? 'endgame' : activeBrain === brains.tactical ? 'tactical' : 'unified';
+    // Committee voting: each brain votes on top moves
+    const weights = getCommitteeWeights();
+    const votes = {};  // san → weighted score
+    const brainVotes = {};  // for display
 
-    // Constrained generation: model picks from legal moves only
-    const chosenSAN = activeBrain.generateConstrained(prompt, legalSANs, 0.6);
+    // Collect votes from all available brains
+    const activeBrains = [['unified', brain]];
+    for (const [name, b] of Object.entries(committee)) {
+      if (b && weights[name] > 0.05) activeBrains.push([name, b]);
+    }
 
-    if (chosenSAN) {
-      // Find and execute the matching move
+    for (const [name, b] of activeBrains) {
+      if (!b) continue;
+      const w = weights[name] || 0;
+      // Each brain generates top 2 moves
+      for (let i = 0; i < 2; i++) {
+        const san = b.generateConstrained(prompt, legalSANs, 0.5 + i * 0.3);
+        if (san) {
+          votes[san] = (votes[san] || 0) + w * (2 - i);
+          if (!brainVotes[name]) brainVotes[name] = san;
+        }
+      }
+    }
+
+    // Pick highest-voted move
+    const ranked = Object.entries(votes).sort((a, b) => b[1] - a[1]);
+
+    if (ranked.length > 0) {
+      const chosenSAN = ranked[0][0];
       const match = legalSANs.find(m => m.san === chosenSAN);
       if (match) {
         game.makeMove(match.from, match.to);
         renderBoard();
         renderPGN();
-        const phaseTag = useSplitBrain ? ` [${phaseName}]` : '';
-        setStatus(`Brain played: ${chosenSAN}${phaseTag}. Your turn (${game.turn === 'w' ? 'White' : 'Black'}).`);
+
+        // Build status with committee info
+        const topW = Object.entries(weights).filter(([k,v]) => v > 0.1).sort((a,b) => b[1] - a[1]);
+        const phaseInfo = topW.map(([k,v]) => `${k}:${(v*100).toFixed(0)}%`).join(' ');
+        const agreement = ranked.length > 1 ? (ranked[0][1] / (ranked[0][1] + ranked[1][1]) * 100).toFixed(0) : '100';
+        setStatus(`Brain played: ${chosenSAN} [${phaseInfo}] (${agreement}% agree). Your turn.`);
         document.getElementById('undoBtn').disabled = false;
+
+        // Preload next phase specialists in background
+        preloadForPhase();
         return;
       }
     }
 
-    // Fallback: model's top choice from legal moves using raw logits
-    const ids = activeBrain.encode(prompt);
-    const input = ids.length > activeBrain.config.block_size ? ids.slice(-activeBrain.config.block_size) : ids;
-    const logits = activeBrain.forward(input);
-
-    // Score each legal move by its first character's logit
-    let bestScore = -Infinity, bestMove = legalSANs[0];
-    for (const m of legalSANs) {
-      const firstChar = m.san[0];
-      const tokenId = activeBrain.stoi[firstChar];
-      if (tokenId !== undefined && logits[tokenId] > bestScore) {
-        bestScore = logits[tokenId];
-        bestMove = m;
+    // Fallback: unified brain only
+    const chosenSAN = brain.generateConstrained(prompt, legalSANs, 0.5);
+    if (chosenSAN) {
+      const match = legalSANs.find(m => m.san === chosenSAN);
+      if (match) {
+        game.makeMove(match.from, match.to);
+        renderBoard();
+        renderPGN();
+        setStatus(`Brain played: ${chosenSAN} [unified]. Your turn.`);
+        document.getElementById('undoBtn').disabled = false;
+        preloadForPhase();
+        return;
       }
     }
-    game.makeMove(bestMove.from, bestMove.to);
-    renderBoard();
-    renderPGN();
-    setStatus(`Brain played: ${bestMove.san}. Your turn.`);
-    document.getElementById('undoBtn').disabled = false;
+
+    setStatus('Game over!', 'error');
   }, 50);
 }
 
@@ -1129,15 +1188,21 @@ async function loadBrain() {
     msg.textContent = 'Downloading weights...';
     fill.style.width = '10%';
 
-    msg.textContent = 'Downloading brain weights...';
-    const resp = await fetch('weights.json');
+    // Load unified brain (hub — always active at 40%)
+    msg.textContent = 'Loading unified brain (hub)...';
+    const resp = await fetch('committee_unified.json');
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    fill.style.width = '50%';
-    msg.textContent = 'Parsing weights...';
+    fill.style.width = '40%';
+    msg.textContent = 'Parsing unified brain...';
     const data = await resp.json();
-    fill.style.width = '80%';
-    msg.textContent = 'Initializing brain...';
+    fill.style.width = '60%';
     brain = new KANBrain(data);
+
+    // Pre-load opening specialist
+    fill.style.width = '75%';
+    msg.textContent = 'Loading opening specialist...';
+    await loadSpecialist('opening');
+    committeeReady = Object.keys(committee).length > 0;
 
     fill.style.width = '100%';
     msg.textContent = 'Ready!';
@@ -1145,7 +1210,7 @@ async function loadBrain() {
     setTimeout(() => {
       document.getElementById('loading').style.display = 'none';
       document.getElementById('brainBtn').disabled = false;
-      const modeStr = 'KAN Chess Brain v4';
+      const modeStr = committeeReady ? 'Committee of Experts (Thousand Brains)' : 'Unified brain';
       setStatus(`${modeStr} loaded! You are White. Click a piece to move.`);
       renderBoard();
       renderPGN();
