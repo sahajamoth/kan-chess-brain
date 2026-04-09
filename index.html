@@ -322,9 +322,11 @@ class KANBrain {
     this.stoi = data.tokenizer.stoi;
     this.itos = data.tokenizer.itos;
     this.w = {};
-    // Convert weight arrays to typed arrays for speed
-    for (const [k, v] of Object.entries(data.weights)) {
-      this.w[k] = this.toFlat(v);
+    // Convert weight arrays to typed arrays for speed (skip if binary-loaded)
+    if (data.weights) {
+      for (const [k, v] of Object.entries(data.weights)) {
+        this.w[k] = this.toFlat(v);
+      }
     }
   }
 
