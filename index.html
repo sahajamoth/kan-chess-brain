@@ -266,9 +266,11 @@ class ChessGame {
   getPGN() {
     let pgn = '';
     for (let i = 0; i < this.moves.length; i++) {
+      // v4: Insert {=} annotation token before each move (matches Stockfish-annotated training data)
+      pgn += '{=} ';
       if (i % 2 === 0) pgn += (i/2+1) + '. ';
       pgn += this.moves[i] + ' ';
-      // CB-3: Insert material markers every 20 half-moves (matching training data)
+      // CB-3: Insert material markers every 20 half-moves
       if ((i + 1) % 20 === 0) {
         let w = 0, b = 0;
         for (let sq = 0; sq < 64; sq++) {
@@ -976,9 +978,10 @@ function brainMove() {
     // Add move number prefix for the brain's move
     const moveNum = Math.floor(game.moves.length / 2) + 1;
     const isBlack = game.turn === 'b';
+    // v4: Add {=} annotation token before brain's move (matches training format)
     const prompt = pgn
-      ? pgn + ' ' + (isBlack ? '' : moveNum + '. ')
-      : '{W} 1. ';
+      ? pgn + ' {=} ' + (isBlack ? '' : moveNum + '. ')
+      : '{W} {=} 1. ';
 
     // CB-1: Get legal moves and use constrained decoding
     const legalSANs = game.getLegalSANs();
