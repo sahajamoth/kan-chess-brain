@@ -872,8 +872,9 @@ function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 
 function getCommitteeWeights() {
   const hm = game.moves.length;  // half-moves
-  let pieces = 0;
-  for (let sq = 0; sq < 64; sq++) if (game.board[sq]) pieces++;
+  // Count pieces from FEN
+  const fen = game.engine.fen().split(' ')[0];
+  const pieces = fen.replace(/[0-9/]/g, '').length;
 
   // Smooth phase weights (overlapping sigmoids)
   const w = {
@@ -944,8 +945,8 @@ async function loadSpecialist(name) {
 // Pre-load specialists based on game phase
 async function preloadForPhase() {
   const hm = game.moves.length;
-  let pieces = 0;
-  for (let sq = 0; sq < 64; sq++) if (game.board[sq]) pieces++;
+  const fenParts = game.engine.fen().split(' ')[0];
+  let pieces = fenParts.replace(/[0-9/]/g, '').length;
   // Always load opening at start
   if (hm < 20) await loadSpecialist('opening');
   if (hm >= 8 && hm < 30) await loadSpecialist('early_mid');
@@ -1150,53 +1151,6 @@ function brainMove() {
   }, 50);
 }
 
-function tryExecuteMove(moveStr) {
-  // Parse PGN move and find matching board move
-  const isCastleK = moveStr === 'O-O';
-  const isCastleQ = moveStr === 'O-O-O';
-
-  for (let sq = 0; sq < 64; sq++) {
-    const p = game.pieceAt(sq);
-    if (!p || p.color !== game.turn) continue;
-
-    for (const to of game.getMoves(sq)) {
-      // Save state, make tentative move, check if PGN matches
-      game.history.push({
-        board: game.board.map(x => x ? {...x} : null),
-        turn: game.turn, castling: {...game.castling},
-        enPassant: game.enPassant, moveNum: game.moveNum,
-      });
-
-      const [fr,fc] = game.rc(sq);
-      const [tr,tc] = game.rc(to);
-      const isCapture = !!game.board[to] || to === game.enPassant;
-
-      // Build what this move's PGN would be
-      let testPgn = '';
-      if (p.type === 'K' && Math.abs(tc-fc) === 2) {
-        testPgn = tc > fc ? 'O-O' : 'O-O-O';
-      } else if (p.type === 'P') {
-        if (isCapture) testPgn += 'abcdefgh'[fc] + 'x';
-        testPgn += 'abcdefgh'[tc] + (8-tr);
-        if (tr === 0 || tr === 7) testPgn += '=Q';
-      } else {
-        testPgn += p.type;
-        if (isCapture) testPgn += 'x';
-        testPgn += 'abcdefgh'[tc] + (8-tr);
-      }
-
-      game.history.pop(); // restore
-
-      // Check match (flexible: ignore disambiguation for now)
-      const cleanMove = moveStr.replace(/[+#!?]/, '');
-      if (testPgn === cleanMove || testPgn.includes(cleanMove.slice(-2))) {
-        const result = game.makeMove(sq, to);
-        return result;
-      }
-    }
-  }
-  return null;
-}
 
 function newGame() {
   // W3-3: Save previous game to history (quality = moves played as proxy)
