@@ -653,6 +653,121 @@ class KANBrain {
     return out;
   }
 
+  // CB-2: KV Cache — stores per-layer K,V for all processed positions
+  clearCache() { this._cache = null; }
+
+  // Forward pass for a single new token, using cached K/V from previous tokens
+  // Returns logits for the new token only
+  forwardIncremental(tokenId, position) {
+    const C = this.config;
+    const E = C.n_embd;
+    const nH = C.n_head;
+    const hs = E / nH;
+
+    // Initialize cache on first call
+    if (!this._cache) {
+      this._cache = [];
+      for (let l = 0; l < C.n_layer; l++) {
+        this._cache.push({
+          keys: [],   // array of Float32Array(3*E) per position per head
+          values: [], // same
+        });
+      }
+    }
+
+    // Embedding for new token
+    const wte = this.g('transformer.wte.weight');
+    const wpe = this.g('transformer.wpe.weight');
+    let x = new Float32Array(E);
+    for (let i = 0; i < E; i++)
+      x[i] = wte[tokenId * E + i] + wpe[position * E + i];
+
+    for (let layer = 0; layer < C.n_layer; layer++) {
+      const pfx = `transformer.h.${layer}`;
+      const cache = this._cache[layer];
+
+      // LayerNorm 1
+      const ln1w = this.g(`${pfx}.ln_1.weight`);
+      const ln1b = this.gz(`${pfx}.ln_1.bias`, E);
+      const normed = this.layerNorm(x, E, ln1w, ln1b);
+
+      // Q/K/V for new token only
+      const attnW = this.g(`${pfx}.attn.c_attn.weight`);
+      const qkv = this.linearVec(normed, E, attnW, 3*E);
+
+      // Store K,V in cache
+      cache.keys.push(qkv.slice(E, 2*E));     // K
+      cache.values.push(qkv.slice(2*E, 3*E)); // V
+
+      // Attention: Q(new) attends to all cached K,V
+      const T = cache.keys.length;
+      const attnOut = new Float32Array(E);
+      const scale = 1 / Math.sqrt(hs);
+
+      for (let h = 0; h < nH; h++) {
+        const scores = new Float32Array(T);
+        for (let t = 0; t < T; t++) {
+          let dot = 0;
+          for (let i = 0; i < hs; i++)
+            dot += qkv[h*hs + i] * cache.keys[t][h*hs + i]; // Q · K
+          scores[t] = dot * scale;
+        }
+        const weights = this.softmax(scores, T);
+        for (let t = 0; t < T; t++) {
+          if (weights[t] < 1e-7) continue;
+          for (let i = 0; i < hs; i++)
+            attnOut[h*hs + i] += weights[t] * cache.values[t][h*hs + i];
+        }
+      }
+
+      // Project and residual
+      const projW = this.g(`${pfx}.attn.c_proj.weight`);
+      const projected = this.linearVec(attnOut, E, projW, E);
+      for (let i = 0; i < E; i++) x[i] += projected[i];
+
+      // Hopfield cache
+      if (C.use_hopfield_cache && this.w[`${pfx}.hopfield.patterns`]) {
+        const hPat = this.g(`${pfx}.hopfield.patterns`);
+        const hQW = this.g(`${pfx}.hopfield.query_proj.weight`);
+        const hGW = this.g(`${pfx}.hopfield.gate.weight`);
+        const hGB = this.gz(`${pfx}.hopfield.gate.bias`, E);
+        const hLNw = this.g(`${pfx}.hopfield.ln.weight`);
+        const hLNb = this.gz(`${pfx}.hopfield.ln.bias`, E);
+        const nPat = C.hopfield_patterns;
+        const beta = C.hopfield_beta;
+        const query = this.linearVec(x, E, hQW, E);
+        const hScores = new Float32Array(nPat);
+        for (let p = 0; p < nPat; p++) {
+          for (let i = 0; i < E; i++) hScores[p] += query[i] * hPat[p * E + i];
+          hScores[p] *= beta;
+        }
+        const hW = this.softmax(hScores, nPat);
+        const retrieved = new Float32Array(E);
+        for (let p = 0; p < nPat; p++)
+          for (let i = 0; i < E; i++) retrieved[i] += hW[p] * hPat[p * E + i];
+        const gateRaw = this.linearVec(x, E, hGW, E);
+        const gate = new Float32Array(E);
+        for (let i = 0; i < E; i++) gate[i] = this.sigmoid(gateRaw[i] + hGB[i]);
+        const hopOut = new Float32Array(E);
+        for (let i = 0; i < E; i++) hopOut[i] = x[i] + gate[i] * retrieved[i];
+        x = this.layerNorm(hopOut, E, hLNw, hLNb);
+      }
+
+      // LayerNorm 2 + KAN FFN + residual
+      const ln2w = this.g(`${pfx}.ln_2.weight`);
+      const ln2b = this.gz(`${pfx}.ln_2.bias`, E);
+      const normed2 = this.layerNorm(x, E, ln2w, ln2b);
+      const ffnOut = this.kanFFN(normed2, pfx, C);
+      for (let i = 0; i < E; i++) x[i] += ffnOut[i];
+    }
+
+    // Final LN + LM head
+    const lnFw = this.g('transformer.ln_f.weight');
+    const lnFb = this.gz('transformer.ln_f.bias', E);
+    const final = this.layerNorm(x, E, lnFw, lnFb);
+    return this.linearVec(final, E, this.g('transformer.wte.weight'), C.vocab_size);
+  }
+
   // Generate next tokens (unconstrained, for fallback)
   generate(prompt, maxTokens = 10, temperature = 0.7, topK = 10) {
     let ids = this.encode(prompt);
@@ -684,51 +799,62 @@ class KANBrain {
   }
 
   // CB-1: Constrained generation — only allow characters that form legal moves
+  // CB-2: Uses KV cache for fast incremental generation
   generateConstrained(prompt, legalSANs, temperature = 0.7) {
     if (!legalSANs || legalSANs.length === 0) return null;
 
     const sanStrings = legalSANs.map(m => m.san);
-    let ids = this.encode(prompt);
+    const ids = this.encode(prompt);
     const maxLen = this.config.block_size;
-    let partial = '';  // characters generated so far for this move
+    let partial = '';
+
+    // Warm up cache with the full prompt using full forward pass
+    this.clearCache();
+    const input = ids.length > maxLen ? ids.slice(-maxLen) : ids;
+    // Process all prompt tokens into cache
+    for (let t = 0; t < input.length; t++) {
+      this.forwardIncremental(input[t], t);
+    }
+    let pos = input.length; // next position
 
     for (let step = 0; step < 10; step++) {
-      // Which SANs are still possible given what we've generated so far?
       const candidates = sanStrings.filter(s => s.startsWith(partial));
       if (candidates.length === 0) return null;
-
-      // If only one candidate left, return it
       if (candidates.length === 1) return candidates[0];
 
-      // If partial already matches a complete SAN exactly, and no longer SAN starts with it
       const exactMatch = candidates.find(s => s === partial);
       const longerExists = candidates.some(s => s.length > partial.length);
       if (exactMatch && !longerExists) return exactMatch;
 
-      // Get valid next characters
+      // Valid next characters
       const validNextChars = new Set();
       for (const san of candidates) {
-        if (san.length > partial.length) {
-          validNextChars.add(san[partial.length]);
-        }
+        if (san.length > partial.length) validNextChars.add(san[partial.length]);
       }
 
-      // Forward pass
-      const input = ids.length > maxLen ? ids.slice(-maxLen) : ids;
-      const logits = this.forward(input);
+      // Incremental forward pass (uses KV cache — only computes 1 token!)
+      const lastToken = step === 0
+        ? input[input.length - 1]  // last prompt token (already cached, get logits)
+        : ids[ids.length - 1];      // last generated token
 
-      // Temperature
+      let logits;
+      if (step === 0) {
+        // We already computed all tokens, just need the logits from last position
+        // Re-run last token to get logits (it's cached, fast)
+        logits = this.forwardIncremental(lastToken, pos - 1);
+        // Remove the duplicate from cache
+        for (const c of this._cache) { c.keys.pop(); c.values.pop(); }
+      } else {
+        logits = this.forwardIncremental(lastToken, pos - 1);
+      }
+
+      // Temperature + masking
       for (let j = 0; j < logits.length; j++) logits[j] /= temperature;
-
-      // Mask: only allow valid next characters
       for (let j = 0; j < logits.length; j++) {
         const ch = this.itos[String(j)] || '';
-        if (!validNextChars.has(ch)) {
-          logits[j] = -Infinity;
-        }
+        if (!validNextChars.has(ch)) logits[j] = -Infinity;
       }
 
-      // Softmax and sample
       const probs = this.softmax(logits, logits.length);
       let r = Math.random(), cum = 0, next = 0;
       for (let j = 0; j < probs.length; j++) {
@@ -739,17 +865,15 @@ class KANBrain {
       const ch = this.itos[String(next)] || '';
       partial += ch;
       ids.push(next);
+      pos++;
 
-      // Check if we've completed a valid SAN
       if (sanStrings.includes(partial)) {
-        // Check if any longer SAN also starts with this
         const longerStill = sanStrings.some(s => s.length > partial.length && s.startsWith(partial));
-        if (!longerStill) return partial;
-        // If there's a longer option, keep going (e.g., "Nc" could be "Nc3" or "Nc6")
+        if (!longerStill) { this.clearCache(); return partial; }
       }
     }
 
-    // If we couldn't complete a move, return the best match
+    this.clearCache();
     const match = sanStrings.find(s => s.startsWith(partial));
     return match || sanStrings[0];
   }
