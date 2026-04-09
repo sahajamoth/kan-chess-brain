@@ -157,7 +157,8 @@ class ChessGame {
   getLegalSANs() {
     const moves = this.engine.moves({ verbose: true });
     return moves.map(m => ({
-      san: m.san,
+      san: m.san.replace(/[+#]/g, ''),  // strip check/checkmate for constrained decoder
+      fullSan: m.san,
       from: (8 - parseInt(m.from[1])) * 8 + 'abcdefgh'.indexOf(m.from[0]),
       to: (8 - parseInt(m.to[1])) * 8 + 'abcdefgh'.indexOf(m.to[0]),
     }));
@@ -1115,18 +1116,29 @@ function brainMove() {
     }
 
     // Fallback: unified brain only
-    const chosenSAN = brain.generateConstrained(prompt, legalSANs, 0.5);
-    if (chosenSAN) {
-      const match = legalSANs.find(m => m.san === chosenSAN);
-      if (match) {
-        game.makeMove(match.from, match.to);
+    const chosenSAN2 = brain.generateConstrained(prompt, legalSANs, 0.5);
+    if (chosenSAN2) {
+      const match2 = legalSANs.find(m => m.san === chosenSAN2);
+      if (match2) {
+        game.makeMove(match2.from, match2.to);
         renderBoard();
         renderPGN();
-        setStatus(`Brain played: ${chosenSAN} [unified]. Your turn.`);
+        setStatus(`Brain played: ${chosenSAN2} [unified]. Your turn.`);
         document.getElementById('undoBtn').disabled = false;
         preloadForPhase();
         return;
       }
+    }
+
+    // Last resort: play first legal move
+    if (legalSANs.length > 0) {
+      const m = legalSANs[0];
+      game.makeMove(m.from, m.to);
+      renderBoard();
+      renderPGN();
+      setStatus(`Brain played: ${m.san} [fallback]. Your turn.`);
+      document.getElementById('undoBtn').disabled = false;
+      return;
     }
 
     setStatus('Game over!', 'error');
