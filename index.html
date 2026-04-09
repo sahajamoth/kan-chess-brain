@@ -66,6 +66,7 @@ h1 { color: #00d4ff; margin-bottom: 5px; font-size: 1.4em; }
     </div>
     <div class="status" id="status">Loading brain weights...</div>
     <div class="pgn-box" id="pgn"></div>
+    <canvas id="manifoldCanvas" width="300" height="120" style="background:#0d0d1a;border:1px solid #333;width:100%"></canvas>
     <div class="info">
       <b>How it works:</b> This is a 536K-parameter KAN (Kolmogorov-Arnold Network) language model
       trained on 20,000 chess games. It has a <b>Hopfield memory cache</b> (32 stored opening patterns),
@@ -882,6 +883,113 @@ class KANBrain {
 }
 
 // ============================================================
+// W3-2: Adaptive temperature based on position complexity
+function getAdaptiveTemperature(game) {
+  const legalCount = game.getLegalSANs().length;
+  const hasCapture = game.getLegalSANs().some(m => m.san.includes('x'));
+  if (legalCount <= 3) return 0.3;        // forced/near-forced
+  if (hasCapture && legalCount < 10) return 0.45;  // tactical
+  if (legalCount > 25) return 0.8;        // wide open position
+  return 0.55;                            // normal
+}
+
+// W3-3: Experience replay — save/load games from localStorage
+function saveGameToHistory(game, quality) {
+  try {
+    const history = JSON.parse(localStorage.getItem('chess_brain_history') || '[]');
+    history.push({ pgn: game.getPGN(), moves: game.moves.length, quality, ts: Date.now() });
+    // Keep top 20 games by quality
+    history.sort((a, b) => b.quality - a.quality);
+    localStorage.setItem('chess_brain_history', JSON.stringify(history.slice(0, 20)));
+  } catch(e) {}
+}
+function getBestGamesForReplay() {
+  try {
+    const history = JSON.parse(localStorage.getItem('chess_brain_history') || '[]');
+    return history.slice(0, 5);
+  } catch(e) { return []; }
+}
+
+// W3-4: Prediction error as confidence signal
+function computeSurprise(brain, ids) {
+  // Quick forward pass, check if prediction heads produce high error
+  // Simplified: use logit entropy as proxy for surprise
+  const input = ids.length > brain.config.block_size ? ids.slice(-brain.config.block_size) : ids;
+  const logits = brain.forward(input);
+  const probs = brain.softmax(logits, logits.length);
+  let entropy = 0;
+  for (let i = 0; i < probs.length; i++) {
+    if (probs[i] > 1e-7) entropy -= probs[i] * Math.log(probs[i]);
+  }
+  // High entropy = high surprise = uncertain position
+  return entropy;
+}
+
+// W3-5: Neural manifold — track hidden states for visualization
+let manifoldPoints = [];
+let manifoldPCA = null; // pre-computed PCA axes
+
+function addManifoldPoint(brain, ids, moveNum, phase) {
+  // Capture last layer hidden state after forward pass
+  // We approximate by using the logits distribution as a fingerprint
+  const input = ids.length > brain.config.block_size ? ids.slice(-brain.config.block_size) : ids;
+  const logits = brain.forward(input);
+  // Use top-10 logit indices as a compact representation
+  const indexed = Array.from(logits).map((v, i) => ({ v, i }));
+  indexed.sort((a, b) => b.v - a.v);
+  const fingerprint = indexed.slice(0, 10).map(x => x.v);
+  manifoldPoints.push({ fingerprint, moveNum, phase });
+}
+
+function renderManifold() {
+  const canvas = document.getElementById('manifoldCanvas');
+  if (!canvas || manifoldPoints.length < 2) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = '#0d0d1a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Simple 2D projection: use first two fingerprint values
+  const xs = manifoldPoints.map(p => p.fingerprint[0]);
+  const ys = manifoldPoints.map(p => p.fingerprint[1]);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const xRange = xMax - xMin || 1, yRange = yMax - yMin || 1;
+
+  const phaseColors = {
+    opening: '#00ff88', early_mid: '#00ddff', late_mid: '#ffdd00',
+    pre_endgame: '#ff8800', endgame: '#ff4444', unified: '#888888'
+  };
+
+  // Draw trajectory
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < manifoldPoints.length; i++) {
+    const x = ((xs[i] - xMin) / xRange) * (W - 20) + 10;
+    const y = ((ys[i] - yMin) / yRange) * (H - 20) + 10;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Draw points
+  for (let i = 0; i < manifoldPoints.length; i++) {
+    const x = ((xs[i] - xMin) / xRange) * (W - 20) + 10;
+    const y = ((ys[i] - yMin) / yRange) * (H - 20) + 10;
+    const color = phaseColors[manifoldPoints[i].phase] || '#888';
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, i === manifoldPoints.length - 1 ? 5 : 3, 0, Math.PI * 2);
+    ctx.fill();
+    // Move number label for every 5th point
+    if (i % 5 === 0) {
+      ctx.fillStyle = '#666';
+      ctx.font = '9px monospace';
+      ctx.fillText(manifoldPoints[i].moveNum, x + 6, y + 3);
+    }
+  }
+}
+
 // UI
 // ============================================================
 const UNICODE_PIECES = {
@@ -920,15 +1028,54 @@ function getCommitteeWeights() {
   return w;
 }
 
-// Lazy-load a specialist brain
+// W3-1: Load brain from binary file using manifest
+let _manifest = null;
+async function loadBrainBinary(name, manifest) {
+  _manifest = manifest;
+  const info = manifest.brains[name];
+  if (!info) return null;
+  try {
+    const resp = await fetch(info.bin_file);
+    if (!resp.ok) return null;
+    const buf = await resp.arrayBuffer();
+    const allWeights = new Float32Array(buf);
+
+    // Reconstruct weight dict from manifest
+    const w = {};
+    for (const [wname, winfo] of Object.entries(info.weights)) {
+      w[wname] = {
+        data: allWeights.slice(winfo.offset, winfo.offset + winfo.size),
+        shape: winfo.shape,
+      };
+    }
+
+    // Build KANBrain-compatible object
+    const brainData = {
+      config: info.config,
+      tokenizer: manifest.tokenizer,
+      weights: null,  // not used, we pass pre-parsed w
+    };
+    const b = new KANBrain(brainData);
+    b.w = w;  // override with binary-loaded weights
+    return b;
+  } catch(e) { return null; }
+}
+
+// Lazy-load a specialist brain (binary or JSON fallback)
 async function loadSpecialist(name) {
   if (committee[name]) return;
+  // Try binary first
+  if (_manifest && _manifest.brains[name]) {
+    const b = await loadBrainBinary(name, _manifest);
+    if (b) { committee[name] = b; return; }
+  }
+  // JSON fallback
   try {
     const resp = await fetch(`committee_${name}.json`);
     if (!resp.ok) return;
     const data = await resp.json();
     committee[name] = new KANBrain(data);
-  } catch(e) { /* specialist not available */ }
+  } catch(e) {}
 }
 
 // Pre-load specialists based on game phase
@@ -1041,23 +1188,33 @@ function brainMove() {
       return;
     }
 
+    // W3-2: Adaptive temperature based on position complexity
+    const baseTemp = getAdaptiveTemperature(game);
+
+    // W3-4: Prediction error → adjust temperature
+    const surprise = computeSurprise(brain, brain.encode(prompt));
+    const maxEntropy = Math.log(brain.config.vocab_size);
+    const surpriseRatio = surprise / maxEntropy;  // 0-1
+    const adjustedTemp = baseTemp * (0.7 + 0.6 * surpriseRatio);  // higher surprise → higher temp
+
     // Committee voting: each brain votes on top moves
     const weights = getCommitteeWeights();
-    const votes = {};  // san → weighted score
-    const brainVotes = {};  // for display
+    const votes = {};
+    const brainVotes = {};
 
-    // Collect votes from all available brains
     const activeBrains = [['unified', brain]];
     for (const [name, b] of Object.entries(committee)) {
       if (b && weights[name] > 0.05) activeBrains.push([name, b]);
     }
 
+    // Determine dominant phase for manifold tracking
+    const topPhase = Object.entries(weights).sort((a,b) => b[1] - a[1])[0][0];
+
     for (const [name, b] of activeBrains) {
       if (!b) continue;
       const w = weights[name] || 0;
-      // Each brain generates top 2 moves
       for (let i = 0; i < 2; i++) {
-        const san = b.generateConstrained(prompt, legalSANs, 0.5 + i * 0.3);
+        const san = b.generateConstrained(prompt, legalSANs, adjustedTemp + i * 0.2);
         if (san) {
           votes[san] = (votes[san] || 0) + w * (2 - i);
           if (!brainVotes[name]) brainVotes[name] = san;
@@ -1076,11 +1233,16 @@ function brainMove() {
         renderBoard();
         renderPGN();
 
+        // W3-5: Track manifold point
+        addManifoldPoint(brain, brain.encode(game.getPGN()), moveNum, topPhase);
+        renderManifold();
+
         // Build status with committee info
         const topW = Object.entries(weights).filter(([k,v]) => v > 0.1).sort((a,b) => b[1] - a[1]);
         const phaseInfo = topW.map(([k,v]) => `${k}:${(v*100).toFixed(0)}%`).join(' ');
         const agreement = ranked.length > 1 ? (ranked[0][1] / (ranked[0][1] + ranked[1][1]) * 100).toFixed(0) : '100';
-        setStatus(`Brain played: ${chosenSAN} [${phaseInfo}] (${agreement}% agree). Your turn.`);
+        const tempStr = `T=${adjustedTemp.toFixed(2)}`;
+        setStatus(`Brain played: ${chosenSAN} [${phaseInfo}] ${tempStr} (${agreement}% agree). Your turn.`);
         document.getElementById('undoBtn').disabled = false;
 
         // Preload next phase specialists in background
@@ -1157,11 +1319,17 @@ function tryExecuteMove(moveStr) {
 }
 
 function newGame() {
+  // W3-3: Save previous game to history (quality = moves played as proxy)
+  if (game.moves.length > 4) {
+    saveGameToHistory(game, game.moves.length);
+  }
   game.reset();
   selected = -1;
   validMoves = [];
+  manifoldPoints = [];  // W3-5: Reset manifold
   renderBoard();
   renderPGN();
+  renderManifold();
   setStatus('New game! You are White. Click a piece to move.');
   document.getElementById('undoBtn').disabled = true;
 }
@@ -1188,21 +1356,38 @@ async function loadBrain() {
     msg.textContent = 'Downloading weights...';
     fill.style.width = '10%';
 
-    // Load unified brain (hub — always active at 40%)
-    msg.textContent = 'Loading unified brain (hub)...';
-    const resp = await fetch('committee_unified.json');
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    fill.style.width = '40%';
-    msg.textContent = 'Parsing unified brain...';
-    const data = await resp.json();
-    fill.style.width = '60%';
-    brain = new KANBrain(data);
+    // W3-1: Try binary weights first, fall back to JSON
+    let manifest = null;
+    try {
+      msg.textContent = 'Loading brain manifest...';
+      const mResp = await fetch('brain_manifest.json');
+      if (mResp.ok) manifest = await mResp.json();
+    } catch(e) {}
 
-    // Pre-load opening specialist
-    fill.style.width = '75%';
-    msg.textContent = 'Loading opening specialist...';
-    await loadSpecialist('opening');
-    committeeReady = Object.keys(committee).length > 0;
+    if (manifest) {
+      // Binary loading path
+      fill.style.width = '20%';
+      msg.textContent = 'Loading unified brain (binary)...';
+      brain = await loadBrainBinary('unified', manifest);
+      fill.style.width = '50%';
+      msg.textContent = 'Loading opening specialist...';
+      const ob = await loadBrainBinary('opening', manifest);
+      if (ob) committee.opening = ob;
+      committeeReady = true;
+    } else {
+      // JSON fallback
+      msg.textContent = 'Loading unified brain (JSON)...';
+      const resp = await fetch('committee_unified.json');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      fill.style.width = '40%';
+      const data = await resp.json();
+      fill.style.width = '60%';
+      brain = new KANBrain(data);
+      fill.style.width = '75%';
+      msg.textContent = 'Loading opening specialist...';
+      await loadSpecialist('opening');
+      committeeReady = Object.keys(committee).length > 0;
+    }
 
     fill.style.width = '100%';
     msg.textContent = 'Ready!';
