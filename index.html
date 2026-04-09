@@ -1129,39 +1129,15 @@ async function loadBrain() {
     msg.textContent = 'Downloading weights...';
     fill.style.width = '10%';
 
-    // Try split brain first, fall back to unified
-    let splitLoaded = false;
-    try {
-      msg.textContent = 'Downloading split brain (3 specialists)...';
-      const splitResp = await fetch('split_weights.json');
-      if (splitResp.ok) {
-        fill.style.width = '40%';
-        msg.textContent = 'Parsing split brain...';
-        const splitData = await splitResp.json();
-        fill.style.width = '60%';
-        msg.textContent = 'Initializing opening brain...';
-        brains.opening = new KANBrain(splitData.brains.opening);
-        msg.textContent = 'Initializing tactical brain...';
-        brains.tactical = new KANBrain(splitData.brains.tactical);
-        msg.textContent = 'Initializing endgame brain...';
-        brains.endgame = new KANBrain(splitData.brains.endgame);
-        brain = brains.opening; // default
-        useSplitBrain = true;
-        splitLoaded = true;
-      }
-    } catch(e) { /* split not available, use unified */ }
-
-    if (!splitLoaded) {
-      msg.textContent = 'Downloading unified brain...';
-      const resp = await fetch('weights.json');
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      fill.style.width = '50%';
-      msg.textContent = 'Parsing weights...';
-      const data = await resp.json();
-      fill.style.width = '80%';
-      msg.textContent = 'Initializing brain...';
-      brain = new KANBrain(data);
-    }
+    msg.textContent = 'Downloading brain weights...';
+    const resp = await fetch('weights.json');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    fill.style.width = '50%';
+    msg.textContent = 'Parsing weights...';
+    const data = await resp.json();
+    fill.style.width = '80%';
+    msg.textContent = 'Initializing brain...';
+    brain = new KANBrain(data);
 
     fill.style.width = '100%';
     msg.textContent = 'Ready!';
@@ -1169,7 +1145,7 @@ async function loadBrain() {
     setTimeout(() => {
       document.getElementById('loading').style.display = 'none';
       document.getElementById('brainBtn').disabled = false;
-      const modeStr = useSplitBrain ? 'Split brain (opening + tactical + endgame)' : 'Unified brain';
+      const modeStr = 'KAN Chess Brain v4';
       setStatus(`${modeStr} loaded! You are White. Click a piece to move.`);
       renderBoard();
       renderPGN();
