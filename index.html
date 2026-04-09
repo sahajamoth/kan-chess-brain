@@ -268,8 +268,45 @@ class ChessGame {
     for (let i = 0; i < this.moves.length; i++) {
       if (i % 2 === 0) pgn += (i/2+1) + '. ';
       pgn += this.moves[i] + ' ';
+      // CB-3: Insert material markers every 20 half-moves (matching training data)
+      if ((i + 1) % 20 === 0) {
+        let w = 0, b = 0;
+        for (let sq = 0; sq < 64; sq++) {
+          const p = this.board[sq];
+          if (p) { if (p.color === 'w') w++; else b++; }
+        }
+        pgn += `[${w}v${b}] `;
+      }
     }
     return pgn.trim();
+  }
+
+  // CB-1: Get all legal moves as SAN strings
+  getLegalSANs() {
+    const sans = [];
+    for (let from = 0; from < 64; from++) {
+      const p = this.board[from];
+      if (!p || p.color !== this.turn) continue;
+      for (const to of this.getMoves(from)) {
+        const [fr,fc] = this.rc(from);
+        const [tr,tc] = this.rc(to);
+        const isCapture = !!this.board[to] || to === this.enPassant;
+        let san = '';
+        if (p.type === 'K' && Math.abs(tc-fc) === 2) {
+          san = tc > fc ? 'O-O' : 'O-O-O';
+        } else if (p.type === 'P') {
+          if (isCapture) san += 'abcdefgh'[fc] + 'x';
+          san += 'abcdefgh'[tc] + (8-tr);
+          if (tr === 0 || tr === 7) san += '=Q';
+        } else {
+          san += p.type;
+          if (isCapture) san += 'x';
+          san += 'abcdefgh'[tc] + (8-tr);
+        }
+        sans.push({ san, from, to });
+      }
+    }
+    return sans;
   }
 }
 
@@ -616,21 +653,18 @@ class KANBrain {
     return out;
   }
 
-  // Generate next tokens
+  // Generate next tokens (unconstrained, for fallback)
   generate(prompt, maxTokens = 10, temperature = 0.7, topK = 10) {
     let ids = this.encode(prompt);
     const maxLen = this.config.block_size;
     let generated = '';
 
     for (let i = 0; i < maxTokens; i++) {
-      // Crop to block size
       const input = ids.length > maxLen ? ids.slice(-maxLen) : ids;
       const logits = this.forward(input);
 
-      // Temperature
       for (let j = 0; j < logits.length; j++) logits[j] /= temperature;
 
-      // Top-K filtering
       const indexed = Array.from(logits).map((v,i) => ({v,i}));
       indexed.sort((a,b) => b.v - a.v);
       const cutoff = indexed[Math.min(topK-1, indexed.length-1)].v;
@@ -638,18 +672,86 @@ class KANBrain {
         if (logits[j] < cutoff) logits[j] = -Infinity;
 
       const probs = this.softmax(logits, logits.length);
+      let r = Math.random(), cum = 0, next = 0;
+      for (let j = 0; j < probs.length; j++) {
+        cum += probs[j];
+        if (cum > r) { next = j; break; }
+      }
+      ids.push(next);
+      generated += this.itos[String(next)] || '?';
+    }
+    return generated;
+  }
 
-      // Sample
+  // CB-1: Constrained generation — only allow characters that form legal moves
+  generateConstrained(prompt, legalSANs, temperature = 0.7) {
+    if (!legalSANs || legalSANs.length === 0) return null;
+
+    const sanStrings = legalSANs.map(m => m.san);
+    let ids = this.encode(prompt);
+    const maxLen = this.config.block_size;
+    let partial = '';  // characters generated so far for this move
+
+    for (let step = 0; step < 10; step++) {
+      // Which SANs are still possible given what we've generated so far?
+      const candidates = sanStrings.filter(s => s.startsWith(partial));
+      if (candidates.length === 0) return null;
+
+      // If only one candidate left, return it
+      if (candidates.length === 1) return candidates[0];
+
+      // If partial already matches a complete SAN exactly, and no longer SAN starts with it
+      const exactMatch = candidates.find(s => s === partial);
+      const longerExists = candidates.some(s => s.length > partial.length);
+      if (exactMatch && !longerExists) return exactMatch;
+
+      // Get valid next characters
+      const validNextChars = new Set();
+      for (const san of candidates) {
+        if (san.length > partial.length) {
+          validNextChars.add(san[partial.length]);
+        }
+      }
+
+      // Forward pass
+      const input = ids.length > maxLen ? ids.slice(-maxLen) : ids;
+      const logits = this.forward(input);
+
+      // Temperature
+      for (let j = 0; j < logits.length; j++) logits[j] /= temperature;
+
+      // Mask: only allow valid next characters
+      for (let j = 0; j < logits.length; j++) {
+        const ch = this.itos[String(j)] || '';
+        if (!validNextChars.has(ch)) {
+          logits[j] = -Infinity;
+        }
+      }
+
+      // Softmax and sample
+      const probs = this.softmax(logits, logits.length);
       let r = Math.random(), cum = 0, next = 0;
       for (let j = 0; j < probs.length; j++) {
         cum += probs[j];
         if (cum > r) { next = j; break; }
       }
 
+      const ch = this.itos[String(next)] || '';
+      partial += ch;
       ids.push(next);
-      generated += this.itos[String(next)] || '?';
+
+      // Check if we've completed a valid SAN
+      if (sanStrings.includes(partial)) {
+        // Check if any longer SAN also starts with this
+        const longerStill = sanStrings.some(s => s.length > partial.length && s.startsWith(partial));
+        if (!longerStill) return partial;
+        // If there's a longer option, keep going (e.g., "Nc" could be "Nc3" or "Nc6")
+      }
     }
-    return generated;
+
+    // If we couldn't complete a move, return the best match
+    const match = sanStrings.find(s => s.startsWith(partial));
+    return match || sanStrings[0];
   }
 }
 
@@ -745,47 +847,59 @@ function brainMove() {
   setStatus('Brain thinking...', 'thinking');
 
   setTimeout(() => {
+    // CB-3: Build PGN with material markers (matching training data format)
     const pgn = game.getPGN();
-    const prompt = pgn ? pgn + ' ' : '{W} 1. ';
+    // Add move number prefix for the brain's move
+    const moveNum = Math.floor(game.moves.length / 2) + 1;
+    const isBlack = game.turn === 'b';
+    const prompt = pgn
+      ? pgn + ' ' + (isBlack ? '' : moveNum + '. ')
+      : '{W} 1. ';
 
-    // Try generating at multiple temperatures
-    let executed = null;
-    for (const temp of [0.6, 0.8, 0.4, 1.0]) {
-      const generated = brain.generate(prompt, 15, temp, 10);
-      const moveMatch = generated.match(/^(\d+\.\s*)?([KQRBN]?[a-h]?[x]?[a-h][1-8](?:=[QRBN])?|O-O-O|O-O)/);
-      if (moveMatch) {
-        const moveStr = moveMatch[2] || moveMatch[0];
-        executed = tryExecuteMove(moveStr);
-        if (executed) break;
-      }
-    }
+    // CB-1: Get legal moves and use constrained decoding
+    const legalSANs = game.getLegalSANs();
 
-    if (executed) {
-      renderBoard();
-      renderPGN();
-      setStatus(`Brain played: ${executed}. Your turn (${game.turn === 'w' ? 'White' : 'Black'}).`);
-      document.getElementById('undoBtn').disabled = false;
+    if (legalSANs.length === 0) {
+      setStatus('Game over! No legal moves.', 'error');
       return;
     }
 
-    // Fallback: random legal move
-    const legalMoves = [];
-    for (let sq = 0; sq < 64; sq++) {
-      const p = game.pieceAt(sq);
-      if (p && p.color === game.turn) {
-        for (const to of game.getMoves(sq))
-          legalMoves.push({from: sq, to});
+    // Constrained generation: model picks from legal moves only
+    const chosenSAN = brain.generateConstrained(prompt, legalSANs, 0.6);
+
+    if (chosenSAN) {
+      // Find and execute the matching move
+      const match = legalSANs.find(m => m.san === chosenSAN);
+      if (match) {
+        game.makeMove(match.from, match.to);
+        renderBoard();
+        renderPGN();
+        setStatus(`Brain played: ${chosenSAN}. Your turn (${game.turn === 'w' ? 'White' : 'Black'}).`);
+        document.getElementById('undoBtn').disabled = false;
+        return;
       }
     }
-    if (legalMoves.length > 0) {
-      const move = legalMoves[Math.floor(Math.random() * legalMoves.length)];
-      game.makeMove(move.from, move.to);
-      renderBoard();
-      renderPGN();
-      setStatus(`Brain played (fallback). Your turn.`);
-    } else {
-      setStatus('Game over!', 'error');
+
+    // Fallback: model's top choice from legal moves using raw logits
+    const ids = brain.encode(prompt);
+    const input = ids.length > brain.config.block_size ? ids.slice(-brain.config.block_size) : ids;
+    const logits = brain.forward(input);
+
+    // Score each legal move by its first character's logit
+    let bestScore = -Infinity, bestMove = legalSANs[0];
+    for (const m of legalSANs) {
+      const firstChar = m.san[0];
+      const tokenId = brain.stoi[firstChar];
+      if (tokenId !== undefined && logits[tokenId] > bestScore) {
+        bestScore = logits[tokenId];
+        bestMove = m;
+      }
     }
+    game.makeMove(bestMove.from, bestMove.to);
+    renderBoard();
+    renderPGN();
+    setStatus(`Brain played: ${bestMove.san}. Your turn.`);
+    document.getElementById('undoBtn').disabled = false;
   }, 50);
 }
 
