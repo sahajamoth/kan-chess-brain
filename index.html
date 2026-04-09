@@ -891,8 +891,22 @@ const UNICODE_PIECES = {
 
 let game = new ChessGame();
 let brain = null;
+let brains = {};  // split brain: {opening, tactical, endgame}
+let useSplitBrain = false;
 let selected = -1;
 let validMoves = [];
+
+// Router: pick the right brain based on game phase
+function getActiveBrain() {
+  if (!useSplitBrain || !brains.opening) return brain;
+  const halfMoves = game.moves.length;
+  // Count material
+  let pieces = 0;
+  for (let sq = 0; sq < 64; sq++) if (game.board[sq]) pieces++;
+  if (pieces <= 12 && halfMoves > 40 && brains.endgame) return brains.endgame;
+  if (halfMoves < 20 && brains.opening) return brains.opening;
+  return brains.tactical || brain;
+}
 
 function renderBoard() {
   const board = document.getElementById('board');
@@ -991,8 +1005,12 @@ function brainMove() {
       return;
     }
 
+    // Route to specialist brain based on game phase
+    const activeBrain = getActiveBrain();
+    const phaseName = activeBrain === brains.opening ? 'opening' : activeBrain === brains.endgame ? 'endgame' : activeBrain === brains.tactical ? 'tactical' : 'unified';
+
     // Constrained generation: model picks from legal moves only
-    const chosenSAN = brain.generateConstrained(prompt, legalSANs, 0.6);
+    const chosenSAN = activeBrain.generateConstrained(prompt, legalSANs, 0.6);
 
     if (chosenSAN) {
       // Find and execute the matching move
@@ -1001,22 +1019,23 @@ function brainMove() {
         game.makeMove(match.from, match.to);
         renderBoard();
         renderPGN();
-        setStatus(`Brain played: ${chosenSAN}. Your turn (${game.turn === 'w' ? 'White' : 'Black'}).`);
+        const phaseTag = useSplitBrain ? ` [${phaseName}]` : '';
+        setStatus(`Brain played: ${chosenSAN}${phaseTag}. Your turn (${game.turn === 'w' ? 'White' : 'Black'}).`);
         document.getElementById('undoBtn').disabled = false;
         return;
       }
     }
 
     // Fallback: model's top choice from legal moves using raw logits
-    const ids = brain.encode(prompt);
-    const input = ids.length > brain.config.block_size ? ids.slice(-brain.config.block_size) : ids;
-    const logits = brain.forward(input);
+    const ids = activeBrain.encode(prompt);
+    const input = ids.length > activeBrain.config.block_size ? ids.slice(-activeBrain.config.block_size) : ids;
+    const logits = activeBrain.forward(input);
 
     // Score each legal move by its first character's logit
     let bestScore = -Infinity, bestMove = legalSANs[0];
     for (const m of legalSANs) {
       const firstChar = m.san[0];
-      const tokenId = brain.stoi[firstChar];
+      const tokenId = activeBrain.stoi[firstChar];
       if (tokenId !== undefined && logits[tokenId] > bestScore) {
         bestScore = logits[tokenId];
         bestMove = m;
@@ -1110,18 +1129,39 @@ async function loadBrain() {
     msg.textContent = 'Downloading weights...';
     fill.style.width = '10%';
 
-    const resp = await fetch('weights.json');
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    // Try split brain first, fall back to unified
+    let splitLoaded = false;
+    try {
+      msg.textContent = 'Downloading split brain (3 specialists)...';
+      const splitResp = await fetch('split_weights.json');
+      if (splitResp.ok) {
+        fill.style.width = '40%';
+        msg.textContent = 'Parsing split brain...';
+        const splitData = await splitResp.json();
+        fill.style.width = '60%';
+        msg.textContent = 'Initializing opening brain...';
+        brains.opening = new KANBrain(splitData.brains.opening);
+        msg.textContent = 'Initializing tactical brain...';
+        brains.tactical = new KANBrain(splitData.brains.tactical);
+        msg.textContent = 'Initializing endgame brain...';
+        brains.endgame = new KANBrain(splitData.brains.endgame);
+        brain = brains.opening; // default
+        useSplitBrain = true;
+        splitLoaded = true;
+      }
+    } catch(e) { /* split not available, use unified */ }
 
-    fill.style.width = '50%';
-    msg.textContent = 'Parsing weights...';
-
-    const data = await resp.json();
-
-    fill.style.width = '80%';
-    msg.textContent = 'Initializing brain...';
-
-    brain = new KANBrain(data);
+    if (!splitLoaded) {
+      msg.textContent = 'Downloading unified brain...';
+      const resp = await fetch('weights.json');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      fill.style.width = '50%';
+      msg.textContent = 'Parsing weights...';
+      const data = await resp.json();
+      fill.style.width = '80%';
+      msg.textContent = 'Initializing brain...';
+      brain = new KANBrain(data);
+    }
 
     fill.style.width = '100%';
     msg.textContent = 'Ready!';
@@ -1129,7 +1169,8 @@ async function loadBrain() {
     setTimeout(() => {
       document.getElementById('loading').style.display = 'none';
       document.getElementById('brainBtn').disabled = false;
-      setStatus('Brain loaded! You are White. Click a piece to move.');
+      const modeStr = useSplitBrain ? 'Split brain (opening + tactical + endgame)' : 'Unified brain';
+      setStatus(`${modeStr} loaded! You are White. Click a piece to move.`);
       renderBoard();
       renderPGN();
     }, 500);
