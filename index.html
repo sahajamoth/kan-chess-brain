@@ -870,24 +870,24 @@ let validMoves = [];
 
 // PIECE-3: Micro-KAN piece agent (pure JS inference)
 class PieceAgentJS {
-  constructor(weights, nHidden, nKnots) {
+  constructor(weights, nHidden, nKnots, inputDim) {
     this.nHidden = nHidden;
     this.nKnots = nKnots;
-    this.fc1 = weights.fc1;  // (nHidden, 386) row-major
-    this.yKnots = weights.yKnots;  // (nHidden, nKnots)
-    this.xKnots = weights.xKnots;  // (nKnots,)
-    this.fc2 = weights.fc2;  // (64, nHidden) row-major
+    this.inputDim = inputDim;  // 578 for v2 (576 board + 2 position)
+    this.fc1 = weights.fc1;
+    this.yKnots = weights.yKnots;
+    this.xKnots = weights.xKnots;
+    this.fc2 = weights.fc2;
   }
   forward(boardFlat, row, col) {
-    const input = new Float32Array(386);
+    const input = new Float32Array(this.inputDim);
     input.set(boardFlat);
-    input[384] = row / 7; input[385] = col / 7;
-    // Layer 1: linear + spline
+    input[this.inputDim - 2] = row / 7;
+    input[this.inputDim - 1] = col / 7;
     const h = new Float32Array(this.nHidden);
     for (let j = 0; j < this.nHidden; j++) {
       let sum = 0;
-      for (let i = 0; i < 386; i++) sum += input[i] * this.fc1[j * 386 + i];
-      // Spline activation
+      for (let i = 0; i < this.inputDim; i++) sum += input[i] * this.fc1[j * this.inputDim + i];
       let v = Math.max(this.xKnots[0], Math.min(this.xKnots[this.nKnots-1], sum));
       let idx = 1;
       while (idx < this.nKnots-1 && this.xKnots[idx] < v) idx++;
@@ -897,7 +897,6 @@ class PieceAgentJS {
       const t = (v - xL) / (xR - xL + 1e-8);
       h[j] = yL + t * (yR - yL);
     }
-    // Layer 2: linear → 64
     const out = new Float32Array(64);
     for (let j = 0; j < 64; j++)
       for (let i = 0; i < this.nHidden; i++)
@@ -906,23 +905,106 @@ class PieceAgentJS {
   }
 }
 
-// Board to tensor (from current player's perspective)
+// Danger detector — predicts if position is dangerous
+class DangerDetectorJS {
+  constructor(weights, nHidden, nKnots) {
+    this.nHidden = nHidden;
+    this.nKnots = nKnots;
+    this.fc1 = weights.fc1;
+    this.yKnots = weights.yKnots;
+    this.xKnots = weights.xKnots;
+    this.fc2w = weights.fc2w;
+    this.fc2b = weights.fc2b;
+  }
+  forward(boardFlat) {
+    const h = new Float32Array(this.nHidden);
+    for (let j = 0; j < this.nHidden; j++) {
+      let sum = 0;
+      for (let i = 0; i < 576; i++) sum += boardFlat[i] * this.fc1[j * 576 + i];
+      let v = Math.max(this.xKnots[0], Math.min(this.xKnots[this.nKnots-1], sum));
+      let idx = 1;
+      while (idx < this.nKnots-1 && this.xKnots[idx] < v) idx++;
+      const xL = this.xKnots[idx-1], xR = this.xKnots[idx];
+      const yL = this.yKnots[j * this.nKnots + idx-1];
+      const yR = this.yKnots[j * this.nKnots + idx];
+      const t = (v - xL) / (xR - xL + 1e-8);
+      h[j] = yL + t * (yR - yL);
+    }
+    let logit = this.fc2b;
+    for (let i = 0; i < this.nHidden; i++) logit += h[i] * this.fc2w[i];
+    return 1 / (1 + Math.exp(-logit));  // sigmoid
+  }
+}
+
+// Board to v2 tensor: 8x8x9 (own_P, own_NBRQ, own_K, enemy_P, enemy_NBRQ, enemy_K, capture_val, attacked, delta)
+let _prevBoardBitmap = null;
+const PIECE_VAL_MAP = {p:1, n:3, b:3, r:5, q:9, k:0};
+
 function boardToTensor(chessEngine) {
-  const board = chessEngine.board();  // 8x8 array from chess.js
+  const board = chessEngine.board();
   const isWhite = chessEngine.turn() === 'w';
-  const t = new Float32Array(384);  // 8x8x6
+  const turn = chessEngine.turn();
+  const enemy = turn === 'w' ? 'b' : 'w';
+  const t = new Float32Array(576);  // 8x8x9
+
+  // Current bitmap for delta calculation
+  const currBitmap = new Float32Array(64);
+
   for (let r = 0; r < 8; r++) {
     for (let c = 0; c < 8; c++) {
       const br = isWhite ? r : 7 - r;
       const piece = board[br][c];
+      const bitmapIdx = br * 8 + c;
+      if (piece) currBitmap[bitmapIdx] = 1;
       if (!piece) continue;
-      const isOwn = (piece.color === chessEngine.turn());
-      const idx = (r * 8 + c) * 6;
+      const isOwn = (piece.color === turn);
+      const idx = (r * 8 + c) * 9;
+      // Ch 0-5: piece type channels
       if (piece.type === 'p') t[idx + (isOwn ? 0 : 3)] = 1;
       else if (piece.type === 'k') t[idx + (isOwn ? 2 : 5)] = 1;
-      else t[idx + (isOwn ? 1 : 4)] = 1;  // n,b,r,q
+      else t[idx + (isOwn ? 1 : 4)] = 1;
+      // Ch 6: capture value (enemy pieces only)
+      if (!isOwn) t[idx + 6] = (PIECE_VAL_MAP[piece.type] || 0) / 9;
+      // Ch 7: attacked-by-enemy (our pieces that are under attack)
+      // Simplified: check if square name appears in enemy's move targets
     }
   }
+
+  // Ch 7: attacked squares — find enemy attack targets via FEN flip
+  try {
+    const fen = chessEngine.fen();
+    const parts = fen.split(' ');
+    parts[1] = parts[1] === 'w' ? 'b' : 'w';
+    parts[3] = '-';
+    const tempEngine = new Chess(parts.join(' '));
+    const enemyMoves = tempEngine.moves({ verbose: true });
+    for (const em of enemyMoves) {
+      // Map to tensor coordinates
+      const tr = 8 - parseInt(em.to[1]);
+      const tc = 'abcdefgh'.indexOf(em.to[0]);
+      const adjR = isWhite ? tr : 7 - tr;
+      const idx = (adjR * 8 + tc) * 9 + 7;
+      // Check if our piece is there
+      const targetPiece = board[tr][tc];
+      if (targetPiece && targetPiece.color === turn) {
+        t[idx] = (PIECE_VAL_MAP[targetPiece.type] || 1) / 9;
+      } else {
+        t[idx] = Math.max(t[idx], 0.1);  // controlled square
+      }
+    }
+  } catch(e) {}
+
+  // Ch 8: delta from previous position
+  if (_prevBoardBitmap) {
+    for (let sq = 0; sq < 64; sq++) {
+      const r = isWhite ? Math.floor(sq / 8) : 7 - Math.floor(sq / 8);
+      const c = sq % 8;
+      const idx = (r * 8 + c) * 9 + 8;
+      t[idx] = currBitmap[sq] - _prevBoardBitmap[sq];
+    }
+  }
+  _prevBoardBitmap = currBitmap;
+
   return t;
 }
 
@@ -966,6 +1048,7 @@ async function loadPieceEnsemble(manifest) {
     const buf = await resp.arrayBuffer();
     const allW = new Float32Array(buf);
     const nH = info.n_hidden, nK = info.n_knots;
+    const inputDim = (info.input_features || 576) + 2;  // board + position
     pieceEnsemble = [];
     for (let pt = 0; pt < 6; pt++) {
       const pfx = `agents.${pt}.`;
@@ -978,9 +1061,25 @@ async function loadPieceEnsemble(manifest) {
         yKnots: allW.slice(yInfo.offset, yInfo.offset + yInfo.size),
         xKnots: allW.slice(xInfo.offset, xInfo.offset + xInfo.size),
         fc2: allW.slice(fc2Info.offset, fc2Info.offset + fc2Info.size),
-      }, nH, nK));
+      }, nH, nK, inputDim));
     }
-    console.log('Piece ensemble loaded: 6 agents, ' + info.total_params + ' params');
+    // Load danger detector if available
+    if (info.has_danger && info.weights['danger.fc1.weight']) {
+      const dfc1 = info.weights['danger.fc1.weight'];
+      const dyK = info.weights['danger.spline1.y_knots'];
+      const dxK = info.weights['danger.spline1.x_knots'];
+      const dfc2w = info.weights['danger.fc2.weight'];
+      const dfc2b = info.weights['danger.fc2.bias'];
+      window._dangerDetector = new DangerDetectorJS({
+        fc1: allW.slice(dfc1.offset, dfc1.offset + dfc1.size),
+        yKnots: allW.slice(dyK.offset, dyK.offset + dyK.size),
+        xKnots: allW.slice(dxK.offset, dxK.offset + dxK.size),
+        fc2w: allW.slice(dfc2w.offset, dfc2w.offset + dfc2w.size),
+        fc2b: allW[dfc2b.offset],
+      }, 8, nK);
+      console.log('Danger detector loaded');
+    }
+    console.log('Piece ensemble v2 loaded: 6 agents + danger, ' + info.total_params + ' params');
   } catch(e) { console.error('Piece ensemble load error:', e); }
 }
 
@@ -1173,7 +1272,17 @@ function brainMove() {
     }
 
     // W3-2: Adaptive temperature based on position complexity
-    const baseTemp = getAdaptiveTemperature(game);
+    let baseTemp = getAdaptiveTemperature(game);
+
+    // Danger detector: if position is dangerous, lower temperature (play safer)
+    if (window._dangerDetector && brain) {
+      const dangerBoard = boardToTensor(game.engine);
+      const dangerScore = window._dangerDetector.forward(dangerBoard);
+      if (dangerScore > 0.6) {
+        baseTemp *= 0.7;  // 30% lower temp in dangerous positions
+        console.log(`Danger: ${(dangerScore*100).toFixed(0)}% — lowering temperature`);
+      }
+    }
 
     // W3-4: Prediction error → adjust temperature
     const surprise = computeSurprise(brain, brain.encode(prompt));
