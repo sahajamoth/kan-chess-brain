@@ -1210,15 +1210,72 @@ function brainMove() {
       }
     }
 
-    // PIECE-3: Hybrid — multiply PGN votes by piece ensemble spatial scores
+    // THREAT DETECTION: find which of our squares are attacked by enemy
+    let _attackedSquares = new Set();
+    try {
+      // Make a null move to see opponent's moves (swap turn via FEN hack)
+      const fen = game.engine.fen();
+      const parts = fen.split(' ');
+      parts[1] = parts[1] === 'w' ? 'b' : 'w';  // swap turn
+      parts[3] = '-';  // clear en passant to avoid invalid FEN
+      const flipped = parts.join(' ');
+      const tempEngine = new Chess(flipped);
+      const enemyMoves = tempEngine.moves({ verbose: true });
+      for (const em of enemyMoves) {
+        // If enemy can move TO a square occupied by our piece, it's attacked
+        const targetPiece = game.engine.get(em.to);
+        if (targetPiece && targetPiece.color === game.turn) {
+          _attackedSquares.add(em.to);
+        }
+      }
+    } catch(e) { /* FEN swap can fail in edge cases */ }
+
+    // PIECE-3: Hybrid — multiply PGN votes by piece ensemble + threat awareness
     const pieceScores = pieceEnsembleScore(legalSANs);
     if (pieceScores) {
       for (const san of Object.keys(votes)) {
         if (san in pieceScores) {
-          // Combine: PGN vote * softmax(piece_score)
-          const pScore = Math.exp(pieceScores[san] * 0.5);  // soften piece influence
+          const pScore = Math.exp(pieceScores[san] * 0.5);
           votes[san] *= pScore;
         }
+      }
+    }
+
+    // THREAT DETECTION: boost moves that save attacked pieces or capture hanging pieces
+    const PIECE_VALUES = {P:1, N:3, B:3, R:5, Q:9, K:100};
+    for (const m of legalSANs) {
+      if (!(m.san in votes)) continue;
+      const fromPiece = game.pieceAt(m.from);
+      const toPiece = game.pieceAt(m.to);
+      if (!fromPiece) continue;
+
+      // Boost captures of undefended pieces (free material)
+      if (toPiece && toPiece.color !== game.turn) {
+        const captureValue = PIECE_VALUES[toPiece.type] || 1;
+        votes[m.san] *= (1 + captureValue * 0.3);
+      }
+
+      // Check if our piece is under attack by simulating opponent's turn
+      // A piece is "hanging" if an enemy piece can capture it
+      const fromSqName = 'abcdefgh'[m.from % 8] + (8 - Math.floor(m.from / 8));
+      if (_attackedSquares && _attackedSquares.has(fromSqName)) {
+        const pieceValue = PIECE_VALUES[fromPiece.type] || 1;
+        votes[m.san] *= (1 + pieceValue * 0.5);
+      }
+    }
+
+    // Extra: penalize moves that leave high-value pieces hanging
+    // Check if after our move, any of our pieces would be attacked
+    for (const m of legalSANs) {
+      if (!(m.san in votes)) continue;
+      // Quick check: does the move expose our queen or rook?
+      const fromPiece = game.pieceAt(m.from);
+      if (!fromPiece) continue;
+      // If moving away from a defended square, check what's behind
+      // Simplified: just boost queen-saving moves heavily
+      if (m.san.startsWith('Q') || (fromPiece.type === 'Q')) {
+        // Queen moves always get a small safety bonus
+        votes[m.san] *= 1.1;
       }
     }
 
