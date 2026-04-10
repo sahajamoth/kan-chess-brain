@@ -1260,7 +1260,7 @@ function brainMove() {
     // v4: Add {=} annotation token before brain's move (matches training format)
     const prompt = pgn
       ? pgn + ' {=} ' + (isBlack ? '' : moveNum + '. ')
-      : '{W} {=} 1. ';
+      : (game.turn === 'w' ? '{W}' : '{B}') + ' {=} 1. ';
 
     // CB-1: Get legal moves and use constrained decoding
     const legalSANs = game.getLegalSANs();
@@ -1344,7 +1344,7 @@ function brainMove() {
     if (pieceScores) {
       for (const san of Object.keys(votes)) {
         if (san in pieceScores) {
-          const pScore = Math.exp(pieceScores[san] * 0.5);
+          const pScore = Math.exp(pieceScores[san] * 1.5);  // strong spatial influence
           votes[san] *= pScore;
         }
       }
@@ -1361,7 +1361,7 @@ function brainMove() {
       // Boost captures of undefended pieces (free material)
       if (toPiece && toPiece.color !== game.turn) {
         const captureValue = PIECE_VALUES[toPiece.type] || 1;
-        votes[m.san] *= (1 + captureValue * 0.3);
+        votes[m.san] *= (1 + captureValue * 0.8);  // strong capture incentive
       }
 
       // Check if our piece is under attack by simulating opponent's turn
@@ -1369,7 +1369,7 @@ function brainMove() {
       const fromSqName = 'abcdefgh'[m.from % 8] + (8 - Math.floor(m.from / 8));
       if (_attackedSquares && _attackedSquares.has(fromSqName)) {
         const pieceValue = PIECE_VALUES[fromPiece.type] || 1;
-        votes[m.san] *= (1 + pieceValue * 0.5);
+        votes[m.san] *= (1 + pieceValue * 1.2);  // strong save-piece incentive
       }
     }
 
